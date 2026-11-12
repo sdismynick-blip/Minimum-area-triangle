@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>단위 정사각형 n개를 담는 최소 넓이 삼각형 탐색</title>
+<style>
+  :root {
+    --surface-1: #f4f4f5;
+    --border-strong: #52525b;
+    --border-accent: #378ADD;
+    --bg-accent: #E6F1FB;
+    --text-secondary: #71717a;
+    --text-muted: #a1a1aa;
+    --radius: 10px;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 640px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    color: #18181b;
+    background: #fff;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: 1rem; }
+  .controls { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end; margin-bottom:1rem; }
+  label { font-size:13px; color:var(--text-secondary); display:block; margin-bottom:4px; }
+  input[type=number] { width:70px; padding:6px; border:1px solid #d4d4d8; border-radius:6px; font-size:14px; }
+  button {
+    padding:8px 14px; border-radius:8px; border:1px solid #d4d4d8; background:#fafafa;
+    cursor:pointer; font-size:14px;
+  }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  button:hover:not(:disabled) { background:#f0f0f0; }
+  .stats { display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:0.75rem; }
+  .stat-box { background:var(--surface-1); border-radius:var(--radius); padding:1rem; }
+  .stat-label { font-size:13px; color:var(--text-secondary); }
+  .stat-value { font-size:22px; font-weight:500; margin-top:2px; }
+  .stat-sub { font-size:12px; color:var(--text-muted); margin-top:2px; }
+  #statusLine { font-size:13px; color:var(--text-secondary); margin-bottom:0.5rem; }
+  .canvas-wrap {
+    position:relative; width:100%; aspect-ratio:1/1; max-width:520px; margin:0 auto;
+    background:var(--surface-1); border-radius:12px; overflow:hidden;
+  }
+  canvas { width:100%; height:100%; display:block; }
+  .note { font-size:13px; color:var(--text-muted); text-align:center; margin-top:0.75rem; }
+</style>
+</head>
+<body>
+
+<h1>단위 정사각형 n개를 담는 최소 넓이 삼각형 탐색 (SA + 서포트 삼각형 정밀화 v2)</h1>
+
+<div class="controls">
+  <div>
+    <label for="nInput">정사각형 개수 n</label>
+    <input type="number" id="nInput" min="1" max="15" value="3" />
+  </div>
+  <button id="startBtn">▶ 시작</button>
+  <button id="pauseBtn" disabled>⏸ 일시정지</button>
+  <button id="extendBtn" style="display:none;">⬆ 더 탐색하기</button>
+  <button id="resetBtn">↻ 초기화</button>
+</div>
+
+<div class="stats">
+  <div class="stat-box">
+    <div class="stat-label">현재 세션 최소 넓이</div>
+    <div class="stat-value" id="bestArea">-</div>
+    <div class="stat-sub" id="bestDensity"></div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-label">n=<span id="storedN">-</span> 저장된 기록</div>
+    <div class="stat-value" id="storedBest">-</div>
+  </div>
+  <div class="stat-box">
+    <div class="stat-label">단계 / 진행률</div>
+    <div class="stat-value" id="progress">-</div>
+  </div>
+</div>
+
+<div id="statusLine">n을 입력하고 시작을 눌러줘</div>
+
+<div class="canvas-wrap">
+  <canvas id="canvas"></canvas>
+</div>
+
+<p class="note">
+  다양화(random restart) → 집중화(best 주변 kick) 2단계 SA 뒤,
+  정사각형 배치에 대한 <b>정확한 최소 서포트 삼각형</b>(변 방향각 3개 최적화)으로 정밀화합니다.
+  담김 조건은 구성상 자동 만족되고, 겹침만 SAT로 검사합니다. n별 최고 기록은 localStorage에 저장됩니다.
+  진짜 최솟값을 증명하지는 않습니다.
+</p>
+
+<script>
+(function(){
+'use strict';
+const HAS_DOM = (typeof document !== 'undefined');
+
+/* ============================================================
+ *  0. 공용 유틸
+ * ============================================================ */
+function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi, v)); }
+function randn(){
+  let u=0,v=0;
+  while(u===0) u = Math.random();
+  while(v===0) v = Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+
+const OVL_EPS   = 1e-9;   // 겹침 허용 오차 (접촉은 허용)
+const AREA_TOL  = 1e-12;  // 개선 판정 오차
+const H_INFLATE = 1e-9;   // 기록 시 서포트 라인 바깥 여유 (엄밀한 담김 보장)
+
+/* ============================================================
+ *  1. 기하 프리미티브
+ * ============================================================ */
+function squareCorners(sq){
+  const c = Math.cos(sq.theta), s = Math.sin(sq.theta);
+  return [
+    {x: sq.x - 0.5*c + 0.5*s, y: sq.y - 0.5*s - 0.5*c},
+    {x: sq.x + 0.5*c + 0.5*s, y: sq.y + 0.5*s - 0.5*c},
+    {x: sq.x + 0.5*c - 0.5*s, y: sq.y + 0.5*s + 0.5*c},
+    {x: sq.x - 0.5*c - 0.5*s, y: sq.y - 0.5*s + 0.5*c}
+  ];
+}
+
+// SAT 침투 깊이 (0이면 분리/접촉)
+function overlapPenetration(sqA, sqB){
+  // 중심 거리로 조기 탈출: 두 단위 정사각형은 중심 거리 > sqrt(2) 면 절대 겹치지 않음
+  const dx = sqA.x - sqB.x, dy = sqA.y - sqB.y;
+  if(dx*dx + dy*dy > 2.0000001) return 0;
+  const A = squareCorners(sqA), B = squareCorners(sqB);
+  const axes = [
+    {x:Math.cos(sqA.theta), y:Math.sin(sqA.theta)},
+    {x:-Math.sin(sqA.theta), y:Math.cos(sqA.theta)},
+    {x:Math.cos(sqB.theta), y:Math.sin(sqB.theta)},
+    {x:-Math.sin(sqB.theta), y:Math.cos(sqB.theta)}
+  ];
+  let minOverlap = Infinity;
+  for(let k=0;k<4;k++){
+    const ax = axes[k];
+    let aMin=Infinity, aMax=-Infinity, bMin=Infinity, bMax=-Infinity;
+    for(let i=0;i<4;i++){
+      let d = A[i].x*ax.x + A[i].y*ax.y;
+      if(d<aMin)aMin=d; if(d>aMax)aMax=d;
+      d = B[i].x*ax.x + B[i].y*ax.y;
+      if(d<bMin)bMin=d; if(d>bMax)bMax=d;
+    }
+    const ov = Math.min(aMax,bMax) - Math.max(aMin,bMin);
+    if(ov <= 0) return 0;
+    if(ov < minOverlap) minOverlap = ov;
+  }
+  return minOverlap;
+}
+
+// SA 페널티용: 삼각형 (0,0)-(bx,0)-(cx,cy) 밖으로 나간 정도
+function containViolation(tri, sq){
+  const bx = tri.bx, cx = tri.cx, cy = tri.cy;
+  const sgn = (bx*cy) >= 0 ? 1 : -1;
+  const corners = squareCorners(sq);
+  // 세 변: (0,0)->(bx,0), (bx,0)->(cx,cy), (cx,cy)->(0,0)
+  const ex = [bx, cx-bx, -cx], ey = [0, cy, -cy];
+  const ax = [0, bx, cx], ay = [0, 0, cy];
+  let viol = 0;
+  for(let p=0;p<4;p++){
+    const px = corners[p].x, py = corners[p].y;
+    for(let i=0;i<3;i++){
+      const cross = ex[i]*(py-ay[i]) - ey[i]*(px-ax[i]);
+      const len = Math.hypot(ex[i], ey[i]) || 1e-9;
+      const dist = (cross/len)*sgn;
+      if(dist < 0) viol += -dist;
+    }
+  }
+  return viol;
+}
+
+function overlapTotal(squares){
+  let s = 0;
+  for(let i=0;i<squares.length;i++)
+    for(let j=i+1;j<squares.length;j++)
+      s += overlapPenetration(squares[i], squares[j]);
+  return s;
+}
+// 정사각형 idx 하나에 대한 겹침 합 (이동 후보 검사용)
+function overlapOf(squares, idx){
+  let s = 0;
+  for(let j=0;j<squares.length;j++){
+    if(j===idx) continue;
+    s += overlapPenetration(squares[idx], squares[j]);
+  }
+  return s;
+}
+
+/* ============================================================
+ *  2. 서포트 삼각형 (정확한 최소 삼각형 표현)
+ *  정사각형 배치가 고정되면, 세 변의 바깥 법선각 φ1,φ2,φ3 만으로
+ *  최소 삼각형이 결정된다: 각 변은 코너 점집합의 받침선(support line).
+ *  → 담김 조건이 '구성상' 자동 만족. 페널티 근사가 필요 없음.
+ * ============================================================ */
+function collectCorners(squares, out){
+  out.length = 0;
+  for(let i=0;i<squares.length;i++){
+    const cs = squareCorners(squares[i]);
+    out.push(cs[0], cs[1], cs[2], cs[3]);
+  }
+  return out;
+}
+
+// pts, phi[3] → {area, verts:[3]} 또는 null(퇴화/무계)
+function supportTri(pts, phi, inflate){
+  const inf = inflate || 0;
+  const nx = [Math.cos(phi[0]), Math.cos(phi[1]), Math.cos(phi[2])];
+  const ny = [Math.sin(phi[0]), Math.sin(phi[1]), Math.sin(phi[2])];
+  const h = [ -Infinity, -Infinity, -Infinity ];
+  for(let p=0;p<pts.length;p++){
+    const x = pts[p].x, y = pts[p].y;
+    for(let i=0;i<3;i++){
+      const d = x*nx[i] + y*ny[i];
+      if(d > h[i]) h[i] = d;
+    }
+  }
+  h[0]+=inf; h[1]+=inf; h[2]+=inf;
+  // 꼭짓점: 변 i, j 의 교점
+  const verts = new Array(3);
+  for(let i=0;i<3;i++){
+    const j = (i+1)%3;
+    const det = nx[i]*ny[j] - ny[i]*nx[j];
+    if(Math.abs(det) < 1e-12) return null;
+    verts[i] = {
+      x: (h[i]*ny[j] - h[j]*ny[i]) / det,
+      y: (nx[i]*h[j] - nx[j]*h[i]) / det
+    };
+  }
+  // 유계성 검사: 각 교점이 남은 세 번째 반평면을 만족해야 진짜 삼각형
+  for(let i=0;i<3;i++){
+    const k = (i+2)%3;
+    const v = verts[i];
+    if(v.x*nx[k] + v.y*ny[k] > h[k] + 1e-7) return null;
+  }
+  const area = 0.5*Math.abs(
+    (verts[1].x-verts[0].x)*(verts[2].y-verts[0].y) -
+    (verts[1].y-verts[0].y)*(verts[2].x-verts[0].x)
+  );
+  if(!(area > 1e-9) || !isFinite(area)) return null;
+  return { area, verts };
+}
+
+// 기존 tri 파라미터 → 세 변의 바깥 법선각
+function phiFromTri(tri){
+  const A = {x:0,y:0}, B = {x:tri.bx,y:0}, C = {x:tri.cx,y:tri.cy};
+  const edges = [[A,B,C],[B,C,A],[C,A,B]];
+  const phi = [];
+  for(const [P,Q,R] of edges){
+    let nxv = Q.y-P.y, nyv = -(Q.x-P.x);
+    if(nxv*(R.x-P.x) + nyv*(R.y-P.y) > 0){ nxv=-nxv; nyv=-nyv; }
+    phi.push(Math.atan2(nyv, nxv));
+  }
+  return phi;
+}
+
+// 각 3개만 좌표하강으로 최적화 (배치 고정) → 그 배치의 '정확한' 최소 삼각형에 근접
+function angleDescent(pts, phi, maxSweeps){
+  let st = supportTri(pts, phi);
+  if(!st) return Infinity;
+  let bestArea = st.area;
+  let step = 0.2;
+  let sweeps = 0;
+  const cap = maxSweeps || 120;
+  while(step > 2e-7 && sweeps < cap){
+    let improved = false;
+    for(let i=0;i<3;i++){
+      const orig = phi[i];
+      for(const cand of [orig+step, orig-step]){
+        phi[i] = cand;
+        const t = supportTri(pts, phi);
+        if(t && t.area < bestArea - AREA_TOL){
+          bestArea = t.area; improved = true;
+          break;
+        }
+        phi[i] = orig;
+      }
+    }
+    if(!improved) step *= 0.5;
+    sweeps++;
+  }
+  return bestArea;
+}
+
+// (squares, phi) → 저장/렌더 호환 정규형 {area, tri:{bx,cx,cy}, squares}
+function canonicalRecord(squares, phi){
+  const pts = collectCorners(squares, []);
+  const st = supportTri(pts, phi, H_INFLATE);
+  if(!st) return null;
+  let [v0, v1, v2] = st.verts;
+  const cross = (v1.x-v0.x)*(v2.y-v0.y) - (v1.y-v0.y)*(v2.x-v0.x);
+  if(cross < 0){ const t=v1; v1=v2; v2=t; }
+  const alpha = Math.atan2(v1.y-v0.y, v1.x-v0.x);
+  const ca = Math.cos(alpha), sa = Math.sin(alpha);
+  const map = (p)=>({
+    x:  (p.x-v0.x)*ca + (p.y-v0.y)*sa,
+    y: -(p.x-v0.x)*sa + (p.y-v0.y)*ca
+  });
+  const B = map(v1), C = map(v2);
+  const tri = { bx: B.x, cx: C.x, cy: C.y };
+  const sqs = squares.map(s=>{
+    const m = map({x:s.x, y:s.y});
+    return { x:m.x, y:m.y, theta: s.theta - alpha };
+  });
+  return { area: 0.5*Math.abs(tri.bx*tri.cy), tri, squares: sqs };
+}
+
+/* ============================================================
+ *  3. 증분 비용 SA 엔진
+ *  cost = area + K*(containSum + overlapSum) 를 캐시로 유지,
+ *  이동 종류별로 바뀐 항만 갱신. 롤백은 스칼라 undo (deep clone 없음).
+ * ============================================================ */
+function makeEngine(n){
+  const contain = new Float64Array(n);
+  const ovl = new Float64Array(n*n);
+  // undo 버퍼
+  const uContain = new Float64Array(n);
+  const uOvlRow  = new Float64Array(n);
+  const uOvlAll  = new Float64Array(n*n);
+  const uX = new Float64Array(n), uY = new Float64Array(n);
+
+  const eng = {
+    st: null, containSum: 0, overlapSum: 0, area: 0,
+
+    attach(st){
+      this.st = st;
+      this.recomputeAll();
+    },
+    recomputeAll(){
+      const st = this.st, sqs = st.squares;
+      let cs = 0, os = 0;
+      for(let i=0;i<n;i++){
+        contain[i] = containViolation(st.tri, sqs[i]);
+        cs += contain[i];
+      }
+      ovl.fill(0);
+      for(let i=0;i<n;i++)
+        for(let j=i+1;j<n;j++){
+          const v = overlapPenetration(sqs[i], sqs[j]);
+          ovl[i*n+j] = ovl[j*n+i] = v;
+          os += v;
+        }
+      this.containSum = cs;
+      this.overlapSum = os;
+      this.area = 0.5*Math.abs(st.tri.bx*st.tri.cy);
+    },
+    penalty(){ return this.containSum + this.overlapSum; },
+
+    saStep(T, T0){
+      const st = this.st, sqs = st.squares;
+      const frac = clamp(T/T0, 0, 1);
+      const K = 30 + 600*(1-frac);
+      const before = this.area + K*(this.containSum + this.overlapSum);
+      const posSigma = 0.03 + 0.5*frac;
+      const rotSigma = 0.03 + 0.7*frac;
+      const triSigma = 0.03 + 0.6*frac;
+      const moveType = Math.random();
+      let kind, idx=-1, sx=0, sy=0, sth=0, sbx=0, scx=0, scy=0;
+      const savedCS = this.containSum, savedOS = this.overlapSum, savedArea = this.area;
+
+      if(moveType < 0.55 && n > 0){
+        kind = 0;
+        idx = (Math.random()*n)|0;
+        const sq = sqs[idx];
+        sx = sq.x; sy = sq.y; sth = sq.theta;
+        uContain[0] = contain[idx];
+        for(let j=0;j<n;j++) uOvlRow[j] = ovl[idx*n+j];
+        sq.x += randn()*posSigma;
+        sq.y += randn()*posSigma;
+        sq.theta += randn()*rotSigma;
+        const nc = containViolation(st.tri, sq);
+        this.containSum += nc - contain[idx];
+        contain[idx] = nc;
+        for(let j=0;j<n;j++){
+          if(j===idx) continue;
+          const v = overlapPenetration(sq, sqs[j]);
+          this.overlapSum += v - ovl[idx*n+j];
+          ovl[idx*n+j] = ovl[j*n+idx] = v;
+        }
+      } else if(moveType < 0.82){
+        kind = 1;
+        sbx = st.tri.bx; scx = st.tri.cx; scy = st.tri.cy;
+        for(let i=0;i<n;i++) uContain[i] = contain[i];
+        const which = (Math.random()*3)|0;
+        if(which===0) st.tri.bx += randn()*triSigma;
+        else if(which===1) st.tri.cx += randn()*triSigma;
+        else st.tri.cy += randn()*triSigma;
+        st.tri.bx = Math.max(st.tri.bx, 0.2);
+        st.tri.cy = Math.max(st.tri.cy, 0.2);
+        let cs = 0;
+        for(let i=0;i<n;i++){
+          contain[i] = containViolation(st.tri, sqs[i]);
+          cs += contain[i];
+        }
+        this.containSum = cs;
+        this.area = 0.5*Math.abs(st.tri.bx*st.tri.cy);
+      } else {
+        kind = 2;
+        sbx = st.tri.bx; scx = st.tri.cx; scy = st.tri.cy;
+        for(let i=0;i<n;i++){ uX[i]=sqs[i].x; uY[i]=sqs[i].y; uContain[i]=contain[i]; }
+        uOvlAll.set(ovl);
+        const factor = 1 - (0.005 + 0.03*Math.random())*(0.2+frac);
+        st.tri.bx *= factor; st.tri.cx *= factor; st.tri.cy *= factor;
+        for(let i=0;i<n;i++){ sqs[i].x *= factor; sqs[i].y *= factor; }
+        this.recomputeAll();
+      }
+
+      const after = this.area + K*(this.containSum + this.overlapSum);
+      const delta = after - before;
+      const Teff = Math.max(T, 0.0015);
+      if(delta <= 0 || Math.random() < Math.exp(-delta/Teff)) return;
+
+      // --- 거절: undo ---
+      this.containSum = savedCS; this.overlapSum = savedOS; this.area = savedArea;
+      if(kind === 0){
+        const sq = sqs[idx];
+        sq.x = sx; sq.y = sy; sq.theta = sth;
+        contain[idx] = uContain[0];
+        for(let j=0;j<n;j++){ ovl[idx*n+j] = uOvlRow[j]; ovl[j*n+idx] = uOvlRow[j]; }
+      } else if(kind === 1){
+        st.tri.bx = sbx; st.tri.cx = scx; st.tri.cy = scy;
+        for(let i=0;i<n;i++) contain[i] = uContain[i];
+      } else {
+        st.tri.bx = sbx; st.tri.cx = scx; st.tri.cy = scy;
+        for(let i=0;i<n;i++){ sqs[i].x = uX[i]; sqs[i].y = uY[i]; contain[i] = uContain[i]; }
+        ovl.set(uOvlAll);
+      }
+    }
+  };
+  return eng;
+}
+
+/* ============================================================
+ *  4. 초기 배치 / kick
+ * ============================================================ */
+function initState(n, variant){
+  // variant 0: 축정렬 격자, 1: 계단(staircase), 2: 한 줄, 그 외: 지터 격자
+  const k = Math.ceil(Math.sqrt(n));
+  const squares = [];
+  if(variant === 1){
+    // 계단형: 삼각수 기반 완전 계단 (m, m-1, ..., 1) — 직각이등변 빗변과 궁합이 좋음
+    const m = Math.ceil((Math.sqrt(8*n+1)-1)/2); // T_m >= n 인 최소 m
+    let placed = 0, row = 0;
+    while(placed < n){
+      const rowLen = Math.max(1, m - row);
+      for(let col=0; col<rowLen && placed<n; col++){
+        squares.push({x: 0.5 + col*1.001, y: 0.5 + row*1.001, theta: 0});
+        placed++;
+      }
+      row++;
+    }
+    return { tri: {bx: (k+2)*2, cx: 0.2, cy: (k+2)*2}, squares };
+  }
+  if(variant === 2){
+    for(let i=0;i<n;i++) squares.push({x: 0.5 + i*1.001, y: 0.5, theta: 0});
+    return { tri: {bx: (n+2)*1.6, cx: (n+2)*0.8, cy: 3.2}, squares };
+  }
+  const jitterScale = variant===0 ? 0 : 0.45;
+  const aspect = variant===0 ? 1 : (0.5 + Math.random()*1.6);
+  const baseSize = (k+1.6);
+  const bx = baseSize*1.5*Math.sqrt(aspect);
+  const cy = baseSize*1.5/Math.sqrt(aspect);
+  const cx = bx/2 + (variant===0?0:(Math.random()-0.5)*baseSize*0.7);
+  const globalRot = variant===0 ? 0 : (Math.random()-0.5)*1.0;
+  let placed = 0;
+  for(let row=0; row<k && placed<n; row++){
+    for(let col=0; col<k && placed<n; col++){
+      const x = 0.8 + col*1.15 + (Math.random()-0.5)*jitterScale;
+      const y = 0.8 + row*1.15 + (Math.random()-0.5)*jitterScale;
+      squares.push({x, y, theta: globalRot + (Math.random()-0.5)*jitterScale*0.5});
+      placed++;
+    }
+  }
+  return { tri: {bx, cx, cy}, squares };
+}
+
+function kickFrom(best){
+  const st = { tri:{bx:best.tri.bx, cx:best.tri.cx, cy:best.tri.cy},
+               squares: best.squares.map(s=>({x:s.x,y:s.y,theta:s.theta})) };
+  const n = st.squares.length;
+  const kickCount = Math.max(1, Math.round(n*(0.2+0.5*Math.random())));
+  const idxs = [...Array(n).keys()].sort(()=>Math.random()-0.5).slice(0,kickCount);
+  for(const idx of idxs){
+    st.squares[idx].x += randn()*0.35;
+    st.squares[idx].y += randn()*0.35;
+    st.squares[idx].theta += randn()*0.5;
+  }
+  if(Math.random()<0.5){
+    st.tri.bx *= (1+randn()*0.04);
+    st.tri.cx += randn()*0.15;
+    st.tri.cy *= (1+randn()*0.04);
+    st.tri.bx = Math.max(st.tri.bx,0.2);
+    st.tri.cy = Math.max(st.tri.cy,0.2);
+  }
+  return st;
+}
+
+/* ============================================================
+ *  5. 정밀화: repair(겹침 제거) → tighten(각+배치 좌표하강)
+ * ============================================================ */
+// 겹침만 줄이는 복구 스윕: SA가 실현가능성 문턱을 못 넘어도 구조를 살린다
+function repairSweep(squares, step){
+  let improved = false;
+  const n = squares.length;
+  for(let i=0;i<n;i++){
+    const sq = squares[i];
+    let cur = overlapOf(squares, i);
+    if(cur <= 0) continue;
+    const vars = ['x','y','theta'];
+    for(const v of vars){
+      const orig = sq[v];
+      let bestVal = orig, bestOvl = cur;
+      const s = (v==='theta') ? step*1.4 : step;
+      for(const cand of [orig+s, orig-s]){
+        sq[v] = cand;
+        const o = overlapOf(squares, i);
+        if(o < bestOvl - 1e-13){ bestOvl = o; bestVal = cand; }
+      }
+      sq[v] = bestVal;
+      if(bestOvl < cur - 1e-13){ improved = true; cur = bestOvl; }
+    }
+  }
+  return improved;
+}
+function repair(squares, maxSweeps){
+  let step = 0.06;
+  for(let s=0; s<maxSweeps; s++){
+    if(overlapTotal(squares) <= OVL_EPS) return true;
+    const improved = repairSweep(squares, step);
+    if(!improved) step *= 0.6;
+    if(step < 1e-6) break;
+  }
+  return overlapTotal(squares) <= OVL_EPS;
+}
+
+// tighten: 변수 = 각 3개 + 정사각형 3n개. 담김은 서포트 삼각형으로 자동 만족,
+// 겹침만 검사. 넓이는 항상 '그 배치의 정확한 최소 삼각형' 값.
+function tightenState(squares, phiSeed){
+  const pts = collectCorners(squares, []);
+  const phi = phiSeed.slice();
+  angleDescent(pts, phi, 60);
+  return { squares, phi, ptsBuf: pts };
+}
+function tightenArea(ts){
+  collectCorners(ts.squares, ts.ptsBuf);
+  const t = supportTri(ts.ptsBuf, ts.phi);
+  return t ? t.area : Infinity;
+}
+function tightenSweep(ts, step){
+  let improved = false;
+  let curArea = tightenArea(ts);
+  const n = ts.squares.length;
+  // (a) 각 3개
+  for(let i=0;i<3;i++){
+    const orig = ts.phi[i];
+    let bestVal = orig, bestArea = curArea;
+    for(const cand of [orig+step, orig-step]){
+      ts.phi[i] = cand;
+      const a = tightenArea(ts);
+      if(a < bestArea - AREA_TOL){ bestArea = a; bestVal = cand; }
+    }
+    ts.phi[i] = bestVal;
+    if(bestArea < curArea - AREA_TOL){ improved = true; curArea = bestArea; }
+  }
+  // (b) 정사각형 배치 (겹침 검사 필수)
+  for(let i=0;i<n;i++){
+    const sq = ts.squares[i];
+    const vars = ['x','y','theta'];
+    for(const v of vars){
+      const orig = sq[v];
+      let bestVal = orig, bestArea = curArea;
+      const s = (v==='theta') ? step*1.3 : step;
+      for(const cand of [orig+s, orig-s]){
+        sq[v] = cand;
+        if(overlapOf(ts.squares, i) <= OVL_EPS){
+          const a = tightenArea(ts);
+          if(a < bestArea - AREA_TOL){ bestArea = a; bestVal = cand; }
+        }
+      }
+      sq[v] = bestVal;
+      if(bestArea < curArea - AREA_TOL){ improved = true; curArea = bestArea; }
+    }
+  }
+  // (c) 집단 수축: 무게중심 쪽으로 전체/축별 압축 — 개별 이동이 못 푸는
+  //     "여럿이 동시에 조여야 하는" 배치(계단형 등)의 교착을 해소
+  if(n >= 2){
+    let cx0 = 0, cy0 = 0;
+    for(const sq of ts.squares){ cx0 += sq.x; cy0 += sq.y; }
+    cx0 /= n; cy0 /= n;
+    const modes = [[1,1],[1,0],[0,1]]; // [x축 적용, y축 적용]
+    for(const [mx,my] of modes){
+      for(const f of [1-step*0.5, 1+step*0.5]){
+        const sx = new Array(n), sy = new Array(n);
+        for(let i=0;i<n;i++){
+          sx[i] = ts.squares[i].x; sy[i] = ts.squares[i].y;
+          if(mx) ts.squares[i].x = cx0 + f*(sx[i]-cx0);
+          if(my) ts.squares[i].y = cy0 + f*(sy[i]-cy0);
+        }
+        let ok = overlapTotal(ts.squares) <= OVL_EPS;
+        let a = ok ? tightenArea(ts) : Infinity;
+        if(ok && a < curArea - AREA_TOL){
+          improved = true; curArea = a;
+        } else {
+          for(let i=0;i<n;i++){ ts.squares[i].x = sx[i]; ts.squares[i].y = sy[i]; }
+        }
+      }
+    }
+  }
+  // (d) 무작위 방향 프로브: 좌표축이 아닌 '결합 방향'으로 라인서치.
+  //     잼(jam) 상태 — 여러 변수를 동시에 움직여야만 내려가는 배치 — 탈출용
+  {
+    const nv = 3 + 3*n;
+    const dir = new Array(nv);
+    const saved = new Array(nv);
+    const getV = (i)=> i<3 ? ts.phi[i]
+                 : ((i-3)%3===0 ? ts.squares[(i-3)/3|0].x
+                 : (i-3)%3===1 ? ts.squares[(i-3)/3|0].y
+                 : ts.squares[(i-3)/3|0].theta);
+    const setV = (i,v)=>{ if(i<3) ts.phi[i]=v;
+      else { const s=ts.squares[(i-3)/3|0], k=(i-3)%3;
+             if(k===0)s.x=v; else if(k===1)s.y=v; else s.theta=v; } };
+    for(let probe=0; probe<4; probe++){
+      let norm = 0;
+      for(let i=0;i<nv;i++){ dir[i] = randn(); norm += dir[i]*dir[i]; }
+      norm = Math.sqrt(norm) || 1;
+      for(let i=0;i<nv;i++){ dir[i] /= norm; saved[i] = getV(i); }
+      for(const sgn of [1,-1]){
+        for(let i=0;i<nv;i++) setV(i, saved[i] + sgn*step*dir[i]);
+        if(overlapTotal(ts.squares) <= OVL_EPS){
+          const a = tightenArea(ts);
+          if(a < curArea - AREA_TOL){ improved = true; curArea = a; break; }
+        }
+        for(let i=0;i<nv;i++) setV(i, saved[i]);
+      }
+    }
+  }
+  return improved;
+}
+function tightenVarCount(n){ return 3 + 3*n + 14; }
+
+/* ============================================================
+ *  6. 러너 (다양화 → 집중화 → 최종 정밀화)
+ * ============================================================ */
+function currentTemperature(r){
+  const cycleLen = r.curIters / r.curCycles;
+  const cycleIdx = Math.floor(r.saIter / cycleLen);
+  const withinCycle = (r.saIter % cycleLen) / cycleLen;
+  const Tend = 0.0006;
+  const peak = r.curT0 * Math.pow(0.55, cycleIdx);
+  return Math.max(peak * Math.pow(Tend/r.curT0, withinCycle), Tend);
+}
+
+function tryRecord(r, squares, phiSeed){
+  // 겹침 없는 배치 → 정확한 서포트 삼각형으로 스냅해 기록
+  if(overlapTotal(squares) > OVL_EPS) return false;
+  const pts = collectCorners(squares, []);
+  const phi = phiSeed.slice();
+  const area = angleDescent(pts, phi, 90);
+  if(!isFinite(area)) return false;
+  if(!r.globalBest || area < r.globalBest.area - AREA_TOL){
+    const rec = canonicalRecord(squares, phi);
+    if(rec && (!r.globalBest || rec.area < r.globalBest.area)){
+      r.globalBest = rec;
+      if(r.onNewBest) r.onNewBest(rec);
+      return true;
+    }
+  }
+  return false;
+}
+
+function startSubRun(r){
+  if(r.mode==='diversify'){
+    r.st = (r.stageIdx===0 && r.globalBest)
+      ? { tri:{...r.globalBest.tri}, squares: r.globalBest.squares.map(s=>({...s})) }
+      : initState(r.n, r.stageIdx);
+    r.curT0 = 0.5; r.curCycles = 4; r.curIters = r.itersPerDiversify;
+  } else if(r.mode==='intensify'){
+    r.st = r.globalBest ? kickFrom(r.globalBest) : initState(r.n, r.stageIdx);
+    r.curT0 = 0.18; r.curCycles = 2; r.curIters = r.itersPerKick;
+  } else if(r.mode==='final'){
+    // 최종 정밀화: kick 없이 globalBest 그대로, SA 생략
+    r.st = { tri:{...r.globalBest.tri}, squares: r.globalBest.squares.map(s=>({...s})) };
+    r.curIters = 0;
+  }
+  // 초기 배치 자체도 기록 후보로 평가 (계단형 등 구조적 초기값이
+  // SA 고온에서 흐트러지기 전에 반영되도록)
+  if(r.mode !== 'final') tryRecord(r, r.st.squares, phiFromTri(r.st.tri));
+  r.eng.attach(r.st);
+  r.saIter = 0;
+  r.phase = (r.mode==='final') ? 'repair' : 'sa';
+  r.tightenTs = null;
+  r.tightenStep = 0;
+  r.tightenSweepCount = 0;
+}
+
+function advanceStage(r){
+  r.stageIdx++;
+  if(r.mode==='diversify'){
+    if(r.stageIdx >= r.diversifyRestarts){
+      if(r.globalBest){ r.mode='intensify'; r.stageIdx=0; startSubRun(r); }
+      else { r.mode='done'; }
+    } else startSubRun(r);
+  } else if(r.mode==='intensify'){
+    if(r.stageIdx >= r.intensifyKicks){
+      if(r.globalBest){ r.mode='final'; r.stageIdx=0; startSubRun(r); }
+      else r.mode='done';
+    } else startSubRun(r);
+  } else if(r.mode==='final'){
+    r.mode='done';
+  }
+}
+
+function makeRunner(n, seedBest, opts){
+  opts = opts || {};
+  const scale = opts.scale || 1;
+  const diversifyRestarts = opts.diversifyRestarts ?? (n<=3?14 : n<=6?9 : n<=12?6 : 8);
+  const itersPerDiversify = Math.round(clamp(Math.round(2000000/Math.max(n,1)), 45000, 900000)*scale);
+  const intensifyKicks = opts.intensifyKicks ?? (n<=3?20 : n<=6?14 : n<=12?10 : 14);
+  const itersPerKick = Math.round(clamp(Math.round(600000/Math.max(n,1)), 25000, 300000)*scale);
+  const maxTightenSweeps = opts.maxTightenSweeps ?? 260;
+  const nv = tightenVarCount(n);
+  const stageTightenWork = maxTightenSweeps*nv*2;
+  const totalWork = diversifyRestarts*(itersPerDiversify + stageTightenWork)
+                  + intensifyKicks*(itersPerKick + stageTightenWork)
+                  + stageTightenWork*3;
+  const r = {
+    n, diversifyRestarts, itersPerDiversify, intensifyKicks, itersPerKick,
+    maxTightenSweeps,
+    stageIdx: 0, mode: 'diversify', phase: 'sa',
+    st: null, saIter: 0,
+    curT0: 0.5, curCycles: 4, curIters: itersPerDiversify,
+    tightenTs: null, tightenStep: 0, tightenSweepCount: 0,
+    repairCount: 0,
+    globalBest: seedBest ? {
+      area: seedBest.area,
+      tri:{...seedBest.tri},
+      squares: seedBest.squares.map(s=>({...s}))
+    } : null,
+    eng: makeEngine(n),
+    totalWork, doneWork: 0, extraRounds: 0,
+    onNewBest: opts.onNewBest || null
+  };
+  startSubRun(r);
+  return r;
+}
+
+function advance(r, budget){
+  let used = 0;
+  while(used < budget){
+    if(r.mode === 'done') break;
+
+    if(r.phase === 'sa'){
+      const T = currentTemperature(r);
+      r.eng.saStep(T, r.curT0);
+      r.saIter++; r.doneWork++; used++;
+      if(r.saIter % 700 === 0 && r.eng.overlapSum <= OVL_EPS){
+        tryRecord(r, r.st.squares, phiFromTri(r.st.tri));
+      }
+      if(r.saIter >= r.curIters){
+        r.phase = 'repair';
+        r.repairCount = 0;
+      }
+
+    } else if(r.phase === 'repair'){
+      // SA 종료 상태의 겹침을 제거해 '이 재시작의 구조'를 살린다
+      const sqs = r.st.squares;
+      if(overlapTotal(sqs) <= OVL_EPS){
+        r.phase = 'tighten';
+        r.tightenTs = tightenState(sqs, phiFromTri(r.st.tri));
+        r.tightenStep = 0.08;
+        r.tightenSweepCount = 0;
+        continue;
+      }
+      const ok = repair(sqs, 12); // 짧게 여러 번 (프레임 분할)
+      r.repairCount += 12;
+      r.doneWork += 12*r.n*3; used += 12*r.n*3;
+      if(ok){
+        r.phase = 'tighten';
+        r.tightenTs = tightenState(sqs, phiFromTri(r.st.tri));
+        r.tightenStep = 0.08;
+        r.tightenSweepCount = 0;
+      } else if(r.repairCount >= 90){
+        // 복구 실패 → 이 재시작 포기
+        advanceStage(r);
+      }
+
+    } else if(r.phase === 'tighten'){
+      const minStep = (r.mode==='final') ? 2e-8 : 1e-7;
+      const maxSw = (r.mode==='final') ? r.maxTightenSweeps*2 : r.maxTightenSweeps;
+      if(!r.tightenTs || r.tightenStep < minStep || r.tightenSweepCount >= maxSw){
+        if(r.tightenTs) tryRecord(r, r.tightenTs.squares, r.tightenTs.phi);
+        r.doneWork += Math.max(0, (r.maxTightenSweeps - Math.min(r.tightenSweepCount, r.maxTightenSweeps)) * tightenVarCount(r.n)*2);
+        used = budget;
+        advanceStage(r);
+        continue;
+      }
+      const improved = tightenSweep(r.tightenTs, r.tightenStep);
+      r.tightenSweepCount++;
+      const w = tightenVarCount(r.n)*2;
+      r.doneWork += w; used += w;
+      if(!improved) r.tightenStep *= 0.55;
+      // 주기적으로 기록 (중간에 멈춰도 손해 없게)
+      if(r.tightenSweepCount % 40 === 0) tryRecord(r, r.tightenTs.squares, r.tightenTs.phi);
+
+    } else break;
+  }
+}
+
+/* ============================================================
+ *  7. 헤드리스 실행 (검증/벤치용)
+ * ============================================================ */
+function runHeadless(n, opts){
+  const r = makeRunner(n, null, opts || {scale: 0.05, diversifyRestarts: 6, intensifyKicks: 6, maxTightenSweeps: 200});
+  let guard = 0;
+  while(r.mode !== 'done' && guard < 2000){
+    advance(r, 1e6);
+    guard++;
+  }
+  return r.globalBest;
+}
+
+if (typeof module !== 'undefined' && module.exports){
+  module.exports = {
+    squareCorners, overlapPenetration, containViolation, overlapTotal,
+    supportTri, phiFromTri, angleDescent, canonicalRecord,
+    makeEngine, initState, makeRunner, advance, runHeadless,
+    tightenState, tightenSweep, repair, collectCorners
+  };
+}
+
+/* ============================================================
+ *  8. UI (브라우저에서만)
+ * ============================================================ */
+if(HAS_DOM){
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const nInput = document.getElementById('nInput');
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const extendBtn = document.getElementById('extendBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const bestAreaEl = document.getElementById('bestArea');
+  const bestDensityEl = document.getElementById('bestDensity');
+  const storedNEl = document.getElementById('storedN');
+  const storedBestEl = document.getElementById('storedBest');
+  const progressEl = document.getElementById('progress');
+  const statusLineEl = document.getElementById('statusLine');
+
+  function loadStoredBest(n){
+    try{
+      const raw = localStorage.getItem('min_triangle_best_n_'+n);
+      return raw ? JSON.parse(raw) : null;
+    } catch(e){ return null; }
+  }
+  function saveStoredBest(n, record){
+    try{
+      localStorage.setItem('min_triangle_best_n_'+n, JSON.stringify(record));
+    } catch(e){ /* ignore */ }
+  }
+
+  let runner = null;
+  let running = false;
+  let rafId = null;
+  let lastW = 0, lastH = 0;
+
+  function resizeCanvasIfNeeded(){
+    const rect = canvas.parentElement.getBoundingClientRect();
+    if(rect.width === lastW && rect.height === lastH) return rect;
+    lastW = rect.width; lastH = rect.height;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    return rect;
+  }
+  window.addEventListener('resize', ()=>{ lastW = -1; if(!running) render(); });
+
+  function render(){
+    const rect = resizeCanvasIfNeeded();
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0,0,W,H);
+    if(!runner) return;
+    let showSource = runner.globalBest;
+    if(!showSource && runner.phase==='tighten' && runner.tightenTs){
+      const rec = canonicalRecord(runner.tightenTs.squares, runner.tightenTs.phi);
+      if(rec) showSource = rec;
+    }
+    if(!showSource) showSource = runner.st;
+    if(!showSource) return;
+    const tri = showSource.tri, squares = showSource.squares;
+    const V = [{x:0,y:0},{x:tri.bx,y:0},{x:tri.cx,y:tri.cy}];
+    let minX = Math.min(0, tri.cx, tri.bx), maxX = Math.max(0, tri.cx, tri.bx);
+    let minY = Math.min(0, tri.cy), maxY = Math.max(tri.cy, 0.1);
+    for(const sq of squares){
+      for(const c of squareCorners(sq)){
+        minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
+        minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+      }
+    }
+    const pad = 30;
+    const spanX = Math.max(maxX-minX, 0.5), spanY = Math.max(maxY-minY, 0.5);
+    const scale = Math.min((W-2*pad)/spanX, (H-2*pad)/spanY);
+    const offX = pad - minX*scale + (W-2*pad-spanX*scale)/2;
+    const offY = H - pad + minY*scale - (H-2*pad-spanY*scale)/2;
+    function toScreen(p){ return {x: p.x*scale+offX, y: offY - p.y*scale}; }
+    const sv = V.map(toScreen);
+    ctx.beginPath();
+    ctx.moveTo(sv[0].x, sv[0].y);
+    ctx.lineTo(sv[1].x, sv[1].y);
+    ctx.lineTo(sv[2].x, sv[2].y);
+    ctx.closePath();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#52525b';
+    ctx.stroke();
+    for(const sq of squares){
+      const c = squareCorners(sq).map(toScreen);
+      ctx.beginPath();
+      ctx.moveTo(c[0].x, c[0].y);
+      for(let i=1;i<c.length;i++) ctx.lineTo(c[i].x, c[i].y);
+      ctx.closePath();
+      ctx.fillStyle = '#E6F1FB';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#378ADD';
+      ctx.stroke();
+    }
+  }
+
+  function updateStats(){
+    if(!runner) return;
+    if(runner.globalBest){
+      bestAreaEl.textContent = runner.globalBest.area.toFixed(6);
+      bestDensityEl.textContent = '밀도 ' + (runner.n/runner.globalBest.area).toFixed(4);
+    } else {
+      bestAreaEl.textContent = '탐색 중';
+      bestDensityEl.textContent = '';
+    }
+    const pct = Math.min(100, Math.round(100*runner.doneWork/runner.totalWork));
+    const modeLabel = runner.mode==='diversify' ? '다양화'
+                    : runner.mode==='intensify' ? '집중화'
+                    : runner.mode==='final' ? '최종 정밀화' : '완료';
+    const phaseLabel = runner.phase==='sa' ? 'SA' : runner.phase==='repair' ? '복구' : '정밀화';
+    const stageTotal = runner.mode==='diversify'?runner.diversifyRestarts
+                     : runner.mode==='intensify'?runner.intensifyKicks : 1;
+    progressEl.textContent = modeLabel + ' ' + Math.min(runner.stageIdx+1, stageTotal) + '/' + stageTotal + ' · ' + phaseLabel + ' ' + pct + '%';
+    statusLineEl.textContent = runner.mode==='done'
+      ? (runner.globalBest ? '완료 — 최소 넓이 ' + runner.globalBest.area.toFixed(6) : '완료 — 유효 배치를 찾지 못함')
+      : ('상태: ' + modeLabel + (runner.globalBest ? ' (현재 최고 ' + runner.globalBest.area.toFixed(5) + ')' : ' (아직 유효 배치 없음)'));
+  }
+
+  const FRAME_MS = 12; // 프레임당 시간 예산 (기기 성능에 자동 적응)
+  function loop(){
+    if(!running || !runner) return;
+    const t0 = performance.now();
+    while(performance.now() - t0 < FRAME_MS && runner.mode !== 'done'){
+      advance(runner, 6000);
+    }
+    render();
+    updateStats();
+    if(runner.mode !== 'done'){
+      rafId = requestAnimationFrame(loop);
+    } else {
+      running = false;
+      pauseBtn.disabled = true;
+      startBtn.disabled = false;
+      extendBtn.style.display = runner.globalBest ? 'inline-block' : 'none';
+      startBtn.textContent = '▶ 완료';
+    }
+  }
+
+  function startSim(){
+    if(!runner){
+      const n = clamp(parseInt(nInput.value)||3, 1, 15);
+      const stored = loadStoredBest(n);
+      runner = makeRunner(n, stored, {
+        onNewBest: (rec)=>{
+          // 주의: makeRunner 실행 도중(초기 배치 기록)에도 호출되므로
+          // runner 변수가 아니라 클로저의 n을 써야 한다
+          saveStoredBest(n, rec);
+          storedBestEl.textContent = rec.area.toFixed(6);
+        }
+      });
+    }
+    running = true;
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    extendBtn.style.display = 'none';
+    loop();
+  }
+
+  function pauseSim(){
+    running = false;
+    if(rafId) cancelAnimationFrame(rafId);
+    startBtn.disabled = false;
+    pauseBtn.disabled = true;
+  }
+
+  function extendSearch(){
+    if(!runner || !runner.globalBest) return;
+    runner.extraRounds++;
+    const addKicks = 15;
+    runner.intensifyKicks += addKicks;
+    const nv = tightenVarCount(runner.n);
+    runner.totalWork += addKicks*(runner.itersPerKick + runner.maxTightenSweeps*nv*2);
+    runner.mode = 'intensify';
+    runner.stageIdx = Math.max(0, runner.intensifyKicks - addKicks);
+    startSubRun(runner);
+    running = true;
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    extendBtn.style.display = 'none';
+    loop();
+  }
+
+  function resetSim(){
+    pauseSim();
+    runner = null;
+    bestAreaEl.textContent = '-';
+    bestDensityEl.textContent = '';
+    progressEl.textContent = '-';
+    statusLineEl.textContent = 'n을 입력하고 시작을 눌러줘';
+    extendBtn.style.display = 'none';
+    startBtn.textContent = '▶ 시작';
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    const n = clamp(parseInt(nInput.value)||3, 1, 15);
+    storedNEl.textContent = n;
+    const stored = loadStoredBest(n);
+    storedBestEl.textContent = stored ? stored.area.toFixed(6) : '기록 없음';
+  }
+
+  startBtn.addEventListener('click', startSim);
+  pauseBtn.addEventListener('click', pauseSim);
+  extendBtn.addEventListener('click', extendSearch);
+  resetBtn.addEventListener('click', resetSim);
+  nInput.addEventListener('change', resetSim);
+
+  resizeCanvasIfNeeded();
+  resetSim();
+}
+})();
+</script>
+</body>
+</html>
